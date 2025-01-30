@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "paths": {
+      "@/*": ["./src/*"]
+    },
+    "checkJs": true,
+    "jsx": "react-jsx",
+  },
+  "exclude": ["./chatgpt-subtitle-translator"]
+}
