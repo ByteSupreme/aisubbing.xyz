@@ -38,12 +38,16 @@ export function TranslatorApplication() {
   const [srtInputText, setSrtInputText] = useState(sampleSrt)
   const [srtOutputText, setSrtOutputText] = useState(sampleSrt)
   const [inputs, setInputs] = useState(subtitleParser.fromSrt(sampleSrt).map(x => x.text))
-  const [outputs, setOutput] = useState([])
+  const [outputs, setOutput] = useState([]) // holds finished translations (line by line)
   const [streamOutput, setStreamOutput] = useState("")
   const [translatorRunningState, setTranslatorRunningState] = useState(false)
   /** @type {React.MutableRefObject<Translator>} */
   const translatorRef = useRef(null)
   const translatorRunningRef = useRef(false)
+
+  // New state: resumeIndex (number of lines already translated) and error message
+  const [resumeIndex, setResumeIndex] = useState(0)
+  const [errorMessage, setErrorMessage] = useState("")
 
   // Translator Stats
   const [usageInformation, setUsageInformation] = useState(/** @type {typeof Translator.prototype.usage}*/(null))
@@ -89,96 +93,118 @@ export function TranslatorApplication() {
     setRateLimit(Number(value))
   }
 
-  async function generate(e) {
-    e.preventDefault()
-    setTranslatorRunningState(true)
-    console.log("[User Interface]", "Begin Generation")
-    translatorRunningRef.current = true
-    setOutput([])
-    setUsageInformation(null)
-    let currentStream = ""
-    const outputWorkingProgress = subtitleParser.fromSrt(srtInputText)
-    const currentOutputs = []
-    console.log("OPENAI_BASE_URL", baseUrlValue)
-    const openai = createOpenAIClient(APIvalue, true, baseUrlValue)
+  // ---- New Translation Functions ----
 
-    const coolerChatGPTAPI = new CooldownContext(rateLimit, 60000, "ChatGPTAPI")
-    const coolerOpenAIModerator = new CooldownContext(rateLimit, 60000, "OpenAIModerator")
-
-    const TranslatorImplementation = useStructuredMode ? TranslatorStructuredArray : Translator
-
-    translatorRef.current = new TranslatorImplementation({ from: fromLanguage, to: toLanguage }, {
-      openai,
-      cooler: coolerChatGPTAPI,
-      onStreamChunk: (data) => {
-        if (currentStream === '' && data === "\n") {
-          return
-        }
-        currentStream += data
-        setStreamOutput(currentStream)
-      },
-      onStreamEnd: () => {
-        currentStream = ""
-        if (translatorRef.current?.aborted) {
-          return
-        }
-        setStreamOutput("")
-      },
-      onClearLine: () => {
-        const progressLines = currentStream.split("\n")
-        if (progressLines[0] === "") {
-          progressLines.shift()
-        }
-        progressLines.pop()
-        currentStream = progressLines.join("\n") + "\n"
-        if (currentStream === "\n") {
-          currentStream = ""
-        }
-        setStreamOutput(currentStream)
-      },
-      moderationService: {
+  /**
+   * startTranslation starts (or resumes) translation from a given index.
+   * @param {number} startIndex - the index (0-based) to resume from.
+   */
+  async function startTranslation(startIndex = 0) {
+    setErrorMessage("");
+    setTranslatorRunningState(true);
+    translatorRunningRef.current = true;
+  
+    // Parse the original SRT to get a working copy.
+    const outputWorkingProgress = subtitleParser.fromSrt(srtInputText);
+    // If resuming, preserve previous translations.
+    let currentOutputs = startIndex > 0 ? outputs.slice(0, startIndex) : [];
+  
+    const openai = createOpenAIClient(APIvalue, true, baseUrlValue);
+  
+    const coolerChatGPTAPI = new CooldownContext(rateLimit, 60000, "ChatGPTAPI");
+    const coolerOpenAIModerator = new CooldownContext(rateLimit, 60000, "OpenAIModerator");
+  
+    const TranslatorImplementation = useStructuredMode ? TranslatorStructuredArray : Translator;
+  
+    translatorRef.current = new TranslatorImplementation(
+      { from: fromLanguage, to: toLanguage },
+      {
         openai,
-        cooler: coolerOpenAIModerator
-      }
-    }, {
-      useModerator: useModerator,
-      batchSizes: batchSizes, //[10, 50],
-      createChatCompletionRequest: {
-        model: model,
-        temperature: temperature,
-        stream: true
-      },
-    })
-
-    if (systemInstruction) {
-      translatorRef.current.systemInstruction = systemInstruction
-    }
-
-    try {
-      setStreamOutput("")
-      for await (const output of translatorRef.current.translateLines(inputs)) {
-        if (!translatorRunningRef.current) {
-          console.error("[User Interface]", "Aborted")
-          break
+        cooler: coolerChatGPTAPI,
+        onStreamChunk: (data) => {
+          if (streamOutput === '' && data === "\n") {
+            return;
+          }
+          setStreamOutput(prev => prev + data);
+        },
+        onStreamEnd: () => {
+          setStreamOutput("");
+        },
+        onClearLine: () => {
+          const progressLines = streamOutput.split("\n");
+          if (progressLines[0] === "") {
+            progressLines.shift();
+          }
+          progressLines.pop();
+          const newStream = progressLines.join("\n") + "\n";
+          setStreamOutput(newStream === "\n" ? "" : newStream);
+        },
+        moderationService: {
+          openai,
+          cooler: coolerOpenAIModerator
         }
-        currentOutputs.push(output.finalTransform)
-        const srtEntry = outputWorkingProgress[output.index - 1]
-        srtEntry.text = output.finalTransform
-        setOutput([...currentOutputs])
-        setUsageInformation(translatorRef.current.usage)
-        setRPMInformation(translatorRef.current.services.cooler?.rate)
+      },
+      {
+        useModerator: useModerator,
+        batchSizes: batchSizes,
+        createChatCompletionRequest: {
+          model: model,
+          temperature: temperature,
+          stream: true
+        },
       }
-      console.log({ sourceInputWorkingCopy: outputWorkingProgress })
-      setSrtOutputText(subtitleParser.toSrt(outputWorkingProgress))
-    } catch (error) {
-      console.error(error)
-      alert(error?.message ?? error)
+    );
+  
+    if (systemInstruction) {
+      translatorRef.current.systemInstruction = systemInstruction;
     }
-    translatorRunningRef.current = false
-    translatorRef.current = null
-    setTranslatorRunningState(false)
+  
+    try {
+      setStreamOutput("");
+      // Only translate the remaining inputs.
+      const inputsToTranslate = inputs.slice(startIndex);
+      for await (const output of translatorRef.current.translateLines(inputsToTranslate)) {
+        if (!translatorRunningRef.current) {
+          console.error("[User Interface]", "Aborted");
+          break;
+        }
+        // Adjust index: translator yields index starting at 1 for the sliced array.
+        const overallIndex = startIndex + (output.index - 1);
+        currentOutputs[overallIndex] = output.finalTransform;
+  
+        // Update the SRT working copy.
+        const srtEntry = outputWorkingProgress[overallIndex];
+        srtEntry.text = output.finalTransform;
+  
+        // Update state with current progress.
+        setOutput([...currentOutputs]);
+        setUsageInformation(translatorRef.current.usage);
+        setRPMInformation(translatorRef.current.services.cooler?.rate);
+  
+        // **New Change:** Update the srtOutputText continuously so the latest translated text is exported.
+        setSrtOutputText(subtitleParser.toSrt(outputWorkingProgress));
+      }
+      // Update resumeIndex based on translation progress.
+      if (currentOutputs.length >= inputs.length) {
+        setResumeIndex(0);
+      } else {
+        setResumeIndex(currentOutputs.length);
+      }
+    } catch (error) {
+      console.error(error);
+      setErrorMessage(error?.message ?? String(error));
+      setResumeIndex(currentOutputs.length);
+      // Also update the srt output text with the progress so far.
+      setSrtOutputText(subtitleParser.toSrt(outputWorkingProgress));
+    } finally {
+      translatorRunningRef.current = false;
+      translatorRef.current = null;
+      setTranslatorRunningState(false);
+    }
   }
+  
 
+  // Called when user manually stops translation.
   async function stopGeneration() {
     console.error("[User Interface]", "Aborting")
     if (translatorRef.current) {
@@ -187,10 +213,26 @@ export function TranslatorApplication() {
     }
   }
 
+  // When user clicks "Start Over", clear previous progress and start from line 0.
+  async function handleStartOver(e) {
+    e.preventDefault();
+    // Clear previous outputs & resume index.
+    setOutput([]);
+    setResumeIndex(0);
+    await startTranslation(0);
+  }
+
+  // When user clicks "Resume", resume from the last successfully translated line.
+  async function handleResume() {
+    await startTranslation(resumeIndex);
+  }
+
+  // ---- End New Translation Functions ----
+
   return (
     <>
       <div className='w-full'>
-        <form id="translator-config-form" onSubmit={(e) => generate(e)}>
+        <form id="translator-config-form" onSubmit={handleStartOver}>
           <div className='px-4 pt-4 flex flex-wrap justify-between w-full gap-4'>
             <Card className="z-10 w-full shadow-md border" shadow="none">
               <CardHeader className="flex gap-3 pb-0">
@@ -204,7 +246,6 @@ export function TranslatorApplication() {
                     <Input
                       className="w-full md:w-6/12"
                       size='sm'
-                      // autoFocus={true}
                       value={APIvalue}
                       onValueChange={(value) => setAPIKey(value)}
                       isRequired
@@ -364,32 +405,46 @@ export function TranslatorApplication() {
           </div>
         </form>
 
+        {/* Button Panel */}
         <div className='w-full justify-between md:justify-center flex flex-wrap gap-1 sm:gap-4 mt-auto sticky top-0 backdrop-blur px-4 pt-4'>
           <FileUploadButton label={"Import SRT"} onFileSelect={async (file) => {
-            // console.log("File", file);
             try {
               const text = await file.text()
               const parsed = subtitleParser.fromSrt(text)
               setSrtInputText(text)
               setInputs(parsed.map(x => x.text))
+              // Reset progress when a new file is imported
+              setOutput([]);
+              setResumeIndex(0);
             } catch (error) {
               alert(error.message ?? error)
             }
           }} />
-          {!translatorRunningState && (
-            <Button type='submit' form="translator-config-form" color="primary" isDisabled={!APIvalue || translatorRunningState}>
-              Start
-            </Button>
-          )}
-
-          {translatorRunningState && (
-            <Button color="danger" onClick={() => stopGeneration()} isLoading={!streamOutput}>
+          {translatorRunningState ? (
+            <Button color="danger" onClick={stopGeneration} isLoading={!streamOutput}>
               Stop
             </Button>
+          ) : (
+            <>
+              {/* If some progress exists and not complete, show both Resume and Start Over */}
+              {resumeIndex > 0 && resumeIndex < inputs.length ? (
+                <>
+                  <Button type='submit' form="translator-config-form" color="primary" isDisabled={!APIvalue || translatorRunningState}>
+                    Start Over
+                  </Button>
+                  <Button color="primary" onClick={handleResume} isDisabled={!APIvalue || translatorRunningState}>
+                    Resume ({resumeIndex}/{inputs.length})
+                  </Button>
+                </>
+              ) : (
+                <Button type='submit' form="translator-config-form" color="primary" isDisabled={!APIvalue || translatorRunningState}>
+                  Start
+                </Button>
+              )}
+            </>
           )}
 
           <Button color="primary" onClick={() => {
-            // console.log(srtOutputText)
             downloadString(srtOutputText, "text/plain", "export.srt")
           }}>
             Export SRT
@@ -397,19 +452,29 @@ export function TranslatorApplication() {
           <Divider className='mt-3 sm:mt-0' />
         </div>
 
+        {/* Progress and Error Info */}
+        <div className="px-4 mt-4">
+          <p className="text-sm">
+            Translated: {outputs.length} / {inputs.length}
+          </p>
+          {errorMessage && (
+            <Card className="mt-2 border border-danger bg-danger/10">
+              <p className="text-danger p-2">Error: {errorMessage}</p>
+            </Card>
+          )}
+        </div>
+
         <div className="lg:flex lg:gap-4 px-4 mt-4">
           <div className="lg:w-1/2">
             <SubtitleCard label={"Input"}>
               <ol className="py-2 list-decimal line-marker ">
-                {inputs.map((line, i) => {
-                  return (
-                    <li key={i} className=''>
-                      <div className='ml-4 truncate'>
-                        {line}
-                      </div>
-                    </li>
-                  )
-                })}
+                {inputs.map((line, i) => (
+                  <li key={i}>
+                    <div className='ml-4 truncate'>
+                      {line}
+                    </div>
+                  </li>
+                ))}
               </ol>
             </SubtitleCard>
           </div>
@@ -417,16 +482,14 @@ export function TranslatorApplication() {
           <div className="lg:w-1/2">
             <SubtitleCard label={"Output"}>
               <ol className="py-2 list-decimal line-marker ">
-                {outputs.map((line, i) => {
-                  return (
-                    <li key={i} className=''>
-                      <div className='ml-4 truncate'>
-                        {line}
-                      </div>
-                    </li>
-                  )
-                })}
-                <pre className='px-2 text-wrap'>
+                {outputs.map((line, i) => (
+                  <li key={i}>
+                    <div className='ml-4 truncate'>
+                      {line}
+                    </div>
+                  </li>
+                ))}
+                <pre className='px-2 whitespace-pre-wrap'>
                   {streamOutput}
                 </pre>
               </ol>
@@ -445,7 +508,6 @@ export function TranslatorApplication() {
                 <span>{usageInformation?.rate} TPM {RPMInfomation} RPM</span>
               </Card>
             )}
-
           </div>
         </div>
       </div>
