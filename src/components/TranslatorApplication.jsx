@@ -103,19 +103,22 @@ export function TranslatorApplication() {
     setErrorMessage("");
     setTranslatorRunningState(true);
     translatorRunningRef.current = true;
-  
-    // Parse the original SRT to get a working copy.
-    const outputWorkingProgress = subtitleParser.fromSrt(srtInputText);
+
+    // Parse the SRT to get a working copy.
+    // On resume (startIndex > 0), parse srtOutputText to include previous translations
+    const srtToParse = startIndex > 0 ? srtOutputText : srtInputText;
+    const outputWorkingProgress = subtitleParser.fromSrt(srtToParse);
+
     // If resuming, preserve previous translations.
     let currentOutputs = startIndex > 0 ? outputs.slice(0, startIndex) : [];
-  
+
     const openai = createOpenAIClient(APIvalue, true, baseUrlValue);
-  
+
     const coolerChatGPTAPI = new CooldownContext(rateLimit, 60000, "ChatGPTAPI");
     const coolerOpenAIModerator = new CooldownContext(rateLimit, 60000, "OpenAIModerator");
-  
+
     const TranslatorImplementation = useStructuredMode ? TranslatorStructuredArray : Translator;
-  
+
     translatorRef.current = new TranslatorImplementation(
       { from: fromLanguage, to: toLanguage },
       {
@@ -154,11 +157,11 @@ export function TranslatorApplication() {
         },
       }
     );
-  
+
     if (systemInstruction) {
       translatorRef.current.systemInstruction = systemInstruction;
     }
-  
+
     try {
       setStreamOutput("");
       // Only translate the remaining inputs.
@@ -171,16 +174,16 @@ export function TranslatorApplication() {
         // Adjust index: translator yields index starting at 1 for the sliced array.
         const overallIndex = startIndex + (output.index - 1);
         currentOutputs[overallIndex] = output.finalTransform;
-  
+
         // Update the SRT working copy.
         const srtEntry = outputWorkingProgress[overallIndex];
         srtEntry.text = output.finalTransform;
-  
+
         // Update state with current progress.
         setOutput([...currentOutputs]);
         setUsageInformation(translatorRef.current.usage);
         setRPMInformation(translatorRef.current.services.cooler?.rate);
-  
+
         // **New Change:** Update the srtOutputText continuously so the latest translated text is exported.
         setSrtOutputText(subtitleParser.toSrt(outputWorkingProgress));
       }
@@ -202,7 +205,7 @@ export function TranslatorApplication() {
       setTranslatorRunningState(false);
     }
   }
-  
+
 
   // Called when user manually stops translation.
   async function stopGeneration() {
@@ -416,6 +419,7 @@ export function TranslatorApplication() {
               // Reset progress when a new file is imported
               setOutput([]);
               setResumeIndex(0);
+              setSrtOutputText(text); // Also reset srtOutputText to input on new file
             } catch (error) {
               alert(error.message ?? error)
             }
